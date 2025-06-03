@@ -12,7 +12,10 @@ if (EXISTS ${picoVscode})
     include(${picoVscode})
 endif()
 # ====================================================================================
-set(PICO_BOARD pico CACHE STRING "Board type")
+set(PICO_BOARD pico_w CACHE STRING "Board type")
+set(PICO_CYW43_ARCH_THREADSAFE_BACKGROUND ON)         # <-- NOVO
+set(PICO_CYW43_ARCH_POLL ON)                           # <-- NOVO
+set(PICO_ENABLE_MBEDTLS ON)                            # <-- NOVO
 
 cmake_minimum_required(VERSION 3.12)
 
