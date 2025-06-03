@@ -13,7 +13,7 @@ from datetime import datetime
 from openai import OpenAI
 
 # Inicializar o cliente da OpenAI (substitua 'sua_api_key' pela sua chave de API válida)
-client = OpenAI(api_key="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")
+client = OpenAI(api_key="")
 
 
 import telebot
