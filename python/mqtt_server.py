@@ -13,13 +13,39 @@ from datetime import datetime
 from openai import OpenAI
 
 # Inicializar o cliente da OpenAI (substitua 'sua_api_key' pela sua chave de API válida)
-client = OpenAI(api_key="")
+client_openai = OpenAI(api_key="")
+
+
+# Configurar cliente MQTT
+client = mqtt.Client()
 
 
 import telebot
 # import time
 # import datetime
 # import os
+
+# Configurações
+MQTT_BROKER = "172.20.10.13"  # Endereço IP do seu computador
+MQTT_PORT = 1883
+MQTT_TOPIC = "/audio_data/#"
+SAMPLE_RATE = 8000
+AUDIO_DIR = "audio_recordings"
+
+
+MQTT_TRANSCRIPTION_TOPIC = "/transcription"
+
+
+# Criar diretório para salvar os arquivos de áudio se não existir
+if not os.path.exists(AUDIO_DIR):
+    os.makedirs(AUDIO_DIR)
+
+# Variáveis globais para armazenar os chunks de áudio
+audio_chunks = {}
+current_recording = None
+last_chunk_time = 0
+timeout = 3  # segundos para timeout
+
 
 class BotTelegram():
     def __init__(self):
@@ -37,23 +63,6 @@ class BotTelegram():
 # Importar a classe BotTelegram
 bot_telegram = BotTelegram()
 
-
-# Configurações
-MQTT_BROKER = "172.20.10.13"  # Endereço IP do seu computador
-MQTT_PORT = 1883
-MQTT_TOPIC = "/audio_data/#"
-SAMPLE_RATE = 8000
-AUDIO_DIR = "audio_recordings"
-
-# Criar diretório para salvar os arquivos de áudio se não existir
-if not os.path.exists(AUDIO_DIR):
-    os.makedirs(AUDIO_DIR)
-
-# Variáveis globais para armazenar os chunks de áudio
-audio_chunks = {}
-current_recording = None
-last_chunk_time = 0
-timeout = 3  # segundos para timeout
 
 def on_connect(client, userdata, flags, rc):
     """Função chamada quando o cliente se conecta ao broker MQTT"""
@@ -150,7 +159,7 @@ def save_audio():
     
     # enviar para o whisper
     with open(filename, "rb") as audio_file:
-        transcription = client.audio.transcriptions.create(
+        transcription = client_openai.audio.transcriptions.create(
             model="whisper-1",        
             file=audio_file,  # Passa o objeto de arquivo em vez do caminho
             response_format="text"    
@@ -159,6 +168,27 @@ def save_audio():
     print("Transcrição obtida pelo Whisper:")
     
     bot_telegram.send_messagem(transcription)
+    
+    # remova todos os caracteres com acento ou especiais para enviar
+    import unicodedata
+    
+    def remover_acentos(texto):
+        # Normaliza o texto para decomposição Unicode e remove acentos
+        normalizado = unicodedata.normalize('NFD', texto)
+        # Remove caracteres não ASCII (acentos, caracteres especiais, etc.)
+        sem_acentos = ''.join(c for c in normalizado if unicodedata.category(c) != 'Mn')
+        # Remove outros caracteres especiais
+        sem_especiais = ''.join(c for c in sem_acentos if c.isalnum() or c.isspace() or c in '.,!?:-')
+        return sem_especiais
+    
+    transcription_limpa = remover_acentos(transcription)
+    print(f"Transcrição original: {transcription}")
+    print(f"Transcrição sem acentos e caracteres especiais: {transcription_limpa}")
+    
+    # Publicar a transcrição sem acentos de volta para a Pico W
+    client.publish(MQTT_TRANSCRIPTION_TOPIC, transcription_limpa, qos=1)
+    print(f"Transcrição enviada para a Pico W via MQTT no tópico {MQTT_TRANSCRIPTION_TOPIC}\n\n")
+    
     
     
     # Limpar para a próxima gravação
@@ -169,8 +199,7 @@ def main():
     """Função principal"""
     print(f"Iniciando servidor MQTT em {MQTT_BROKER}:{MQTT_PORT}")
     
-    # Configurar cliente MQTT
-    client = mqtt.Client()
+    
     client.on_connect = on_connect
     client.on_message = on_message
     

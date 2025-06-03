@@ -5,6 +5,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 #include "pico/stdlib.h"   // stdlib
 #include "hardware/irq.h"  // interrupts
 #include "hardware/pwm.h"  // pwm
@@ -12,6 +13,7 @@
 #include "hardware/pll.h"
 #include "hardware/clocks.h"
 #include "hardware/adc.h" // adc
+#include "hardware/i2c.h" // i2c para o LCD
 #include <stdlib.h>
 #include "ring.h"
 
@@ -25,6 +27,12 @@
 
 #define AUDIO_OUT_PIN 26
 #define AUDIO_IN_PIN 27
+
+// Definições para o LCD I2C
+#define I2C_PORT i2c0
+#define SDA_PIN 4         // Pino GP4 para SDA
+#define SCL_PIN 5         // Pino GP5 para SCL
+#define LCD_I2C_ADDR 0x27 // Endereço I2C padrão do LCD
 
 #define SAMPLE_RATE 8000
 #define DATA_LENGTH SAMPLE_RATE * 4 // WAV_DATA_LENGTH //16000
@@ -62,6 +70,306 @@ SemaphoreHandle_t xSemaphoreMQTTConnected;
 
 int audio_pin_slice;
 
+// Adicione estas definições junto com as outras no início do arquivo
+#define MQTT_TRANSCRIPTION_TOPIC "/transcription"
+#define MAX_TRANSCRIPTION_LENGTH 1024
+#define SCROLL_DELAY_MS 1000 // Tempo entre rolagens de texto (1 segundo)
+#define SCROLL_STEP 2        // Número de linhas para rolar por vez
+
+// Variável para sinalizar quando uma nova transcrição chega durante a rolagem
+volatile bool interrupt_scroll = false;
+
+// Variáveis e definições para o LCD
+// Comandos LCD
+#define LCD_CLEARDISPLAY 0x01
+#define LCD_RETURNHOME 0x02
+#define LCD_ENTRYMODESET 0x04
+#define LCD_DISPLAYCONTROL 0x08
+#define LCD_CURSORSHIFT 0x10
+#define LCD_FUNCTIONSET 0x20
+#define LCD_SETCGRAMADDR 0x40
+#define LCD_SETDDRAMADDR 0x80
+
+// Flags para controle do display
+#define LCD_DISPLAYON 0x04
+#define LCD_DISPLAYOFF 0x00
+#define LCD_CURSORON 0x02
+#define LCD_CURSOROFF 0x00
+#define LCD_BLINKON 0x01
+#define LCD_BLINKOFF 0x00
+
+// Flags para function set
+#define LCD_8BITMODE 0x10
+#define LCD_4BITMODE 0x00
+#define LCD_2LINE 0x08
+#define LCD_1LINE 0x00
+#define LCD_5x10DOTS 0x04
+#define LCD_5x8DOTS 0x00
+
+// Bits de controle do LCD
+#define LCD_EN 0x04
+#define LCD_RW 0x02
+#define LCD_RS 0x01
+#define LCD_BACKLIGHT 0x08
+
+// Dimensões do LCD
+#define LCD_ROWS 2
+#define LCD_COLS 16
+
+// Funções LCD
+void lcd_write_byte(uint8_t val, uint8_t mode) {
+    uint8_t high = mode | (val & 0xF0) | LCD_BACKLIGHT;
+    uint8_t low = mode | ((val << 4) & 0xF0) | LCD_BACKLIGHT;
+
+    uint8_t data[1];
+
+    // Envio do byte alto
+    data[0] = high;
+    i2c_write_blocking(I2C_PORT, LCD_I2C_ADDR, data, 1, false);
+
+    // Pulso de Enable
+    data[0] = high | LCD_EN;
+    i2c_write_blocking(I2C_PORT, LCD_I2C_ADDR, data, 1, false);
+    sleep_us(1);
+
+    data[0] = high & ~LCD_EN;
+    i2c_write_blocking(I2C_PORT, LCD_I2C_ADDR, data, 1, false);
+    sleep_us(50);
+
+    // Envio do byte baixo
+    data[0] = low;
+    i2c_write_blocking(I2C_PORT, LCD_I2C_ADDR, data, 1, false);
+
+    // Pulso de Enable
+    data[0] = low | LCD_EN;
+    i2c_write_blocking(I2C_PORT, LCD_I2C_ADDR, data, 1, false);
+    sleep_us(1);
+
+    data[0] = low & ~LCD_EN;
+    i2c_write_blocking(I2C_PORT, LCD_I2C_ADDR, data, 1, false);
+    sleep_us(50);
+}
+
+void lcd_command(uint8_t val) {
+    lcd_write_byte(val, 0);
+}
+
+void lcd_write_char(char val) {
+    lcd_write_byte(val, LCD_RS);
+}
+
+void lcd_init() {
+    sleep_ms(50); // Espera para estabilização
+
+    // Sequência de inicialização
+    uint8_t data = LCD_BACKLIGHT;
+    i2c_write_blocking(I2C_PORT, LCD_I2C_ADDR, &data, 1, false);
+    sleep_ms(1000);
+
+    // Inicialização em modo 4 bits, conforme datasheet
+    lcd_command(0x33);
+    sleep_ms(5);
+
+    lcd_command(0x32);
+    sleep_ms(5);
+
+    // Configuração do LCD
+    lcd_command(LCD_FUNCTIONSET | LCD_2LINE | LCD_5x8DOTS | LCD_4BITMODE);
+    sleep_ms(5);
+
+    lcd_command(LCD_DISPLAYCONTROL | LCD_DISPLAYON | LCD_CURSOROFF | LCD_BLINKOFF);
+    sleep_ms(5);
+
+    lcd_command(LCD_CLEARDISPLAY);
+    sleep_ms(5);
+
+    lcd_command(LCD_ENTRYMODESET | 0x02); // Incrementa cursor, sem shift
+    sleep_ms(5);
+}
+
+void lcd_clear() {
+    lcd_command(LCD_CLEARDISPLAY);
+    sleep_ms(2);
+}
+
+void lcd_set_cursor(uint8_t row, uint8_t col) {
+    static uint8_t offsets[] = {0x00, 0x40, 0x14, 0x54};
+    lcd_command(LCD_SETDDRAMADDR | (col + offsets[row]));
+}
+
+void lcd_write_string(const char *str) {
+    while (*str) {
+        lcd_write_char(*str++);
+    }
+}
+
+void lcd_write_message(const char *message) {
+    lcd_clear();
+
+    size_t len = strlen(message);
+
+    if (len <= LCD_COLS) {
+        // Mensagem cabe em uma linha
+        lcd_set_cursor(0, 0);
+        lcd_write_string(message);
+    } else if (len <= LCD_COLS * 2) {
+        // Mensagem cabe em duas linhas
+        lcd_set_cursor(0, 0);
+        char linha1[LCD_COLS + 1];
+        strncpy(linha1, message, LCD_COLS);
+        linha1[LCD_COLS] = '\0';
+        lcd_write_string(linha1);
+
+        lcd_set_cursor(1, 0);
+        lcd_write_string(message + LCD_COLS);
+    } else {
+        // Mensagem muito grande, exibe apenas primeiras duas linhas
+        lcd_set_cursor(0, 0);
+        char linha1[LCD_COLS + 1];
+        strncpy(linha1, message, LCD_COLS);
+        linha1[LCD_COLS] = '\0';
+        lcd_write_string(linha1);
+
+        lcd_set_cursor(1, 0);
+        char linha2[LCD_COLS + 1];
+        strncpy(linha2, message + LCD_COLS, LCD_COLS);
+        linha2[LCD_COLS] = '\0';
+        lcd_write_string(linha2);
+    }
+}
+
+// Função para rolar texto grande no LCD mostrando duas linhas por vez
+void lcd_scroll_message(const char *message) {
+    extern bool new_transcription_received;
+    extern volatile bool interrupt_scroll;
+
+    // Resetar a flag de interrupção no início da rolagem
+    interrupt_scroll = false;
+
+    size_t len = strlen(message);
+
+    // Se a mensagem for pequena, apenas exibimos sem rolagem
+    if (len <= LCD_COLS * 2) {
+        lcd_write_message(message);
+        return;
+    }
+
+    printf("Iniciando rolagem do texto (tamanho: %d caracteres)\n", len);
+
+    // Calcular quantas páginas (de 2 linhas) são necessárias
+    int total_paginas = (len + (LCD_COLS * 2) - 1) / (LCD_COLS * 2);
+    printf("Total de páginas a exibir: %d\n", total_paginas);
+
+    // Preparar cópia do texto
+    char *texto = malloc(len + 1);
+    if (texto == NULL) {
+        lcd_write_message(message);
+        return;
+    }
+
+    strcpy(texto, message);
+
+    // Posição atual da página
+    int pagina_atual = 0;
+
+    // Loop de rolagem infinito até que nova mensagem seja recebida
+    while (!interrupt_scroll) {
+        // Calcular a posição inicial da página atual
+        int pos_inicio = pagina_atual * (LCD_COLS * 2);
+
+        // Limpar o display
+        lcd_clear();
+
+        // Primeira linha da página
+        lcd_set_cursor(0, 0);
+        if (pos_inicio < len) {
+            char linha1[LCD_COLS + 1];
+            int copiar_len = (pos_inicio + LCD_COLS <= len) ? LCD_COLS : (len - pos_inicio);
+            strncpy(linha1, texto + pos_inicio, copiar_len);
+            linha1[copiar_len] = '\0';
+            lcd_write_string(linha1);
+
+            // Imprimir log da linha exibida
+            printf("Página %d/Linha 1: '%s'\n", pagina_atual + 1, linha1);
+        }
+
+        // Segunda linha da página
+        lcd_set_cursor(1, 0);
+        int pos_linha2 = pos_inicio + LCD_COLS;
+        if (pos_linha2 < len) {
+            char linha2[LCD_COLS + 1];
+            int copiar_len = (pos_linha2 + LCD_COLS <= len) ? LCD_COLS : (len - pos_linha2);
+            strncpy(linha2, texto + pos_linha2, copiar_len);
+            linha2[copiar_len] = '\0';
+            lcd_write_string(linha2);
+
+            // Imprimir log da linha exibida
+            printf("Página %d/Linha 2: '%s'\n", pagina_atual + 1, linha2);
+        }
+
+        // Aguardar usando vTaskDelay dividido em pequenos intervalos para resposta mais rápida
+        for (int i = 0; i < SCROLL_DELAY_MS / 50; i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            // Verificar com mais frequência se a rolagem deve ser interrompida
+            if (interrupt_scroll) {
+                printf("Rolagem interrompida por nova mensagem\n");
+                break;
+            }
+        }
+
+        // Verificar novamente se a rolagem deve ser interrompida
+        if (interrupt_scroll) {
+            printf("Rolagem interrompida por nova mensagem\n");
+            break;
+        }
+
+        // Avançar para a próxima página (volta ao início quando chega no final)
+        pagina_atual = (pagina_atual + 1) % total_paginas;
+        
+        // Debug: mostrar quando volta ao início
+        if (pagina_atual == 0 && total_paginas > 1) {
+            printf("Voltando ao início da rolagem\n");
+        }
+    }
+
+    // Limpar recursos
+    free(texto);
+    printf("Rolagem finalizada\n");
+}
+
+// Adicione esta variável global para armazenar a transcrição
+char received_transcription[MAX_TRANSCRIPTION_LENGTH];
+bool new_transcription_received = false;
+
+// Callback para subscrição MQTT
+static void mqtt_sub_request_cb(void *arg, err_t err) {
+    if (err != ERR_OK) {
+        printf("Falha na subscrição MQTT: %d\n", err);
+    } else {
+        printf("Subscrição MQTT bem-sucedida\n");
+    }
+}
+
+// Callbacks para dados recebidos via MQTT
+static void mqtt_incoming_publish_cb(void *arg, const char *topic, u32_t tot_len) {
+    printf("Recebendo publicação no tópico: %s, tamanho total: %lu\n", topic, tot_len);
+}
+
+static void mqtt_incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t flags) {
+    // Copiar a transcrição recebida para o buffer (com limite de tamanho)
+    size_t copy_len = len < (MAX_TRANSCRIPTION_LENGTH - 1) ? len : (MAX_TRANSCRIPTION_LENGTH - 1);
+    memcpy(received_transcription, data, copy_len);
+    received_transcription[copy_len] = '\0'; // Garantir que termine com null
+
+    // Primeiro, interromper qualquer rolagem em andamento
+    interrupt_scroll = true;
+
+    // Sinalizar que uma nova transcrição foi recebida
+    new_transcription_received = true;
+
+    printf("Nova transcrição recebida MQTT: %s\n", received_transcription);
+}
+
 // Callback para publicação MQTT
 static void mqtt_pub_request_cb(void *arg, err_t err) {
     if (err != ERR_OK) {
@@ -80,6 +388,17 @@ static void mqtt_connection_cb(mqtt_client_t *client, void *arg, mqtt_connection
         printf("MQTT conectado com sucesso!\n");
         state->connected = true;
         xSemaphoreGive(xSemaphoreMQTTConnected);
+
+        // Configurar callbacks para receber mensagens
+        mqtt_set_inpub_callback(client, mqtt_incoming_publish_cb, mqtt_incoming_data_cb, arg);
+
+        // Subscrever ao tópico de transcrição
+        err_t err = mqtt_subscribe(client, MQTT_TRANSCRIPTION_TOPIC, 1, mqtt_sub_request_cb, arg);
+        if (err != ERR_OK) {
+            printf("Falha ao subscrever ao tópico %s: %d\n", MQTT_TRANSCRIPTION_TOPIC, err);
+        } else {
+            printf("Subscrito ao tópico %s\n", MQTT_TRANSCRIPTION_TOPIC);
+        }
     } else {
         printf("MQTT falha na conexão: %d\n", status);
         state->connected = false;
@@ -335,6 +654,57 @@ void play_task() {
     }
 }
 
+void process_transcription_task(void *pvParameters) {
+    extern volatile bool interrupt_scroll;
+
+    // Inicializa o display LCD I2C
+    printf("Inicializando o LCD I2C...\n");
+
+    // Configurações do I2C para o LCD
+    i2c_init(I2C_PORT, 100 * 1000); // 100 kHz
+    gpio_set_function(SDA_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(SDA_PIN);
+    gpio_pull_up(SCL_PIN);
+
+    // Inicializa o LCD
+    lcd_init();
+
+    // Exibe mensagem inicial
+    lcd_clear();
+    lcd_set_cursor(0, 0);
+    lcd_write_string("Aguardando");
+    lcd_set_cursor(1, 0);
+    lcd_write_string("transcricao...");
+
+    while (1) {
+        if (new_transcription_received) {
+            printf("Nova transcrição recebida: %s\n", received_transcription);
+            printf("Tamanho da transcrição: %d caracteres\n", strlen(received_transcription));
+
+            // Aguardar um pouco para garantir que a interrupção seja processada
+            vTaskDelay(pdMS_TO_TICKS(100));
+
+            // Resetar a flag antes de iniciar nova exibição
+            new_transcription_received = false;
+
+            // Reiniciar a rolagem com o novo texto
+            if (strlen(received_transcription) > LCD_COLS * 2) {
+                printf("Iniciando rolagem do texto...\n");
+                lcd_scroll_message(received_transcription);
+                printf("Rolagem finalizada\n");
+            } else {
+                // Para textos curtos, apenas exibir normalmente
+                printf("Texto curto, não necessita rolagem\n");
+                lcd_write_message(received_transcription);
+            }
+        }
+
+        // Verificar com frequência maior para responder rapidamente a novas transcrições
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
 int main() {
     stdio_init_all();
     printf("oi\n");
@@ -346,6 +716,7 @@ int main() {
 
     xTaskCreate(play_task, "Play Task", 4095, NULL, 1, NULL);
     xTaskCreate(mic_task, "Mic Task", 4095, NULL, 1, NULL);
+    xTaskCreate(process_transcription_task, "Transcription Task", 2048, NULL, 1, NULL);
 
     vTaskStartScheduler();
 

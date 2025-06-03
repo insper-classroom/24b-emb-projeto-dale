@@ -14,7 +14,8 @@ target_link_libraries(pico_emb
         hardware_pwm 
         hardware_clocks
         freertos
-        pico_lwip_mqtt                              # MQTT
+        hardware_i2c                               # I2C para o LCD
+        pico_lwip_mqtt                             # MQTT
 )
 
 # Adiciona o diretório atual como include path
